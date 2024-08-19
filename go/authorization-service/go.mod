@@ -17,12 +17,14 @@ require (
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20240423153145-555b57ec207b // indirect
+	github.com/emicklei/go-restful/v3 v3.12.1 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/gogo/protobuf v1.3.1 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.20.0 // indirect
+	github.com/sirupsen/logrus v1.9.3 // indirect
 	go.opentelemetry.io/contrib/instrumentation/runtime v0.53.0 // indirect
 	go.opentelemetry.io/contrib/propagators/autoprop v0.53.0 // indirect
 	go.opentelemetry.io/contrib/propagators/aws v1.28.0 // indirect

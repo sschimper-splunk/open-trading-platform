@@ -4,33 +4,29 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log"
-	"log/slog"
-	"net"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
 
-	envoy_api_v2_core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	auth "github.com/envoyproxy/go-control-plane/envoy/service/auth/v2"
-	envoytype "github.com/envoyproxy/go-control-plane/envoy/type"
+	"github.com/emicklei/go-restful/v3/log"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	auth "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	envoytype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/ettec/otp-common/bootstrap"
 	"github.com/ettech/open-trading-platform/go/authorization-service/api/loginservice"
 	"github.com/gogo/googleapis/google/rpc"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 	"github.com/signalfx/splunk-otel-go/distro"
+	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
+
+	"net"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 )
 
 type user struct {
@@ -40,13 +36,18 @@ type user struct {
 	token           string
 }
 
+var globalAPMService string
+
 type authService struct {
 	users map[string]user
 }
 
 func (a *authService) Login(_ context.Context, params *loginservice.LoginParams) (*loginservice.Token, error) {
-
-	log.Printf("logging in")
+	//ctx := context.TODO()
+	ctx, span := otel.Tracer("github.com/my/repo").Start(context.Background(), "Login")
+	defer span.End()
+	spanCtx := trace.SpanContextFromContext(ctx)
+	logrus.WithFields(LogrusFields(spanCtx)).Info("logging in")
 
 	if user, ok := a.users[params.User]; ok {
 		return &loginservice.Token{
@@ -60,14 +61,18 @@ func (a *authService) Login(_ context.Context, params *loginservice.LoginParams)
 
 func (a *authService) Check(_ context.Context, req *auth.CheckRequest) (*auth.CheckResponse, error) {
 
+	ctx := context.TODO()
+	ctx, span := otel.Tracer("github.com/my/repo").Start(context.Background(), "Check")
+	defer span.End()
+	spanCtx := trace.SpanContextFromContext(ctx)
 	path, ok := req.Attributes.Request.Http.Headers[":path"]
-
 	if ok && strings.HasPrefix(path, "/loginservice.LoginService") {
-		slog.Info("permitted login for path", "path", path)
+		logrus.WithFields(LogrusFields(spanCtx)).Info("permitted login for path", "path", path)
 		return newOkResponse(), nil
 	}
 
 	authHeader, ok := req.Attributes.Request.Http.Headers["auth-token"]
+	log.Printf("authHeader: %v", authHeader)
 	if !ok {
 		return newPermissionDeniedResponse("auth-token header is required"), nil
 	}
@@ -86,7 +91,7 @@ func (a *authService) Check(_ context.Context, req *auth.CheckRequest) (*auth.Ch
 		return newUnauthenticatedResponse("invalid token"), nil
 	}
 
-	// Authorisation
+	// Authorization
 	if ok && strings.HasPrefix(path, "/executionvenue.ExecutionVenue") {
 		if strings.Contains(user.permissionFlags, "T") {
 			return newOkResponse(), nil
@@ -105,9 +110,11 @@ func newOkResponse() *auth.CheckResponse {
 		},
 		HttpResponse: &auth.CheckResponse_OkResponse{
 			OkResponse: &auth.OkHttpResponse{
-				Headers: []*envoy_api_v2_core.HeaderValueOption{
+				//Headers: []*envoy_api_v2_core.HeaderValueOption{
+				Headers: []*core.HeaderValueOption{
 					{
-						Header: &envoy_api_v2_core.HeaderValue{
+						//Header: &envoy_api_v2_core.HeaderValue{
+						Header: &core.HeaderValue{
 							Key:   "authorised",
 							Value: "true",
 						},
@@ -153,126 +160,73 @@ func newUnauthenticatedResponse(message string) *auth.CheckResponse {
 const (
 	DatabaseConnectionString = "DB_CONN_STRING"
 	DatabaseDriverName       = "DB_DRIVER_NAME"
+	SplunkServiceName        = "OTEL_SERVICE_NAME" // will be used to grab the env variable with the Env to use
 )
-
-func withTraceMetadata(ctx context.Context, logger *zap.Logger) *zap.Logger {
-	spanContext := trace.SpanContextFromContext(ctx)
-	if !spanContext.IsValid() {
-		// ctx does not contain a valid span.
-		// There is no trace metadata to add.
-		return logger
-	}
-	return logger.With(
-		zap.String("trace_id", spanContext.TraceID().String()),
-		zap.String("span_id", spanContext.SpanID().String()),
-		zap.String("trace_flags", spanContext.TraceFlags().String()),
-	)
-}
 
 func main() {
 
-	// initialize Splunk OTel distro
 	sdk, err := distro.Run()
 	if err != nil {
 		panic(err)
 	}
+	// Flush all spans before the application exits
 	defer func() {
 		if err := sdk.Shutdown(context.Background()); err != nil {
 			panic(err)
 		}
 	}()
+	//Set splunk APM data
 
-	ctx := context.Background()
+	globalAPMService = bootstrap.GetEnvVar(SplunkServiceName)
 
-	// Set up a trace exporter
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithInsecure(),                 // Adjust this depending on your OTLP endpoint
-		otlptracegrpc.WithEndpoint("localhost:4317"), // Update this with your collector's endpoint
-	)
-	if err != nil {
-		log.Fatalf("failed to create trace exporter: %v", err)
-	}
-
-	// Create a resource to describe the service
-	res := resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceNameKey.String("authorization-service"),
-		semconv.ServiceVersionKey.String("1.0.0"),
-		attribute.String("environment", "seb-tradingtst-dev-1-workshop"),
-	)
-
-	// Create a tracer provider
-	tracerProvider := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(res),
-	)
-	defer func() {
-		if err := tracerProvider.Shutdown(ctx); err != nil {
-			log.Fatalf("failed to shutdown tracer provider: %v", err)
-		}
-	}()
-
-	otel.SetTracerProvider(tracerProvider)
-	tracer := otel.Tracer("authorization-service")
-
-	ctx, span := tracer.Start(ctx, "main")
+	//get Tracer into the context
+	//ctx := context.TODO()
+	ctx, span := otel.Tracer("github.com/my/repo").Start(context.Background(), "main")
 	defer span.End()
+	spanCtx := trace.SpanContextFromContext(ctx)
 
-	// Set up a log exporter
-	splunk_logger, err := zap.NewProduction()
-	if err != nil {
-		panic(err)
-	}
-	defer splunk_logger.Sync()
-	trace_logger := withTraceMetadata(ctx, splunk_logger)
+	// Ensure logrus behaves like TTY is disabled
+	logrus.SetFormatter(&logrus.TextFormatter{
+		DisableColors: true,
+		FullTimestamp: true,
+	})
 
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: true})))
-
-	span.AddEvent("Connecting to Database")
 	dbString := bootstrap.GetEnvVar(DatabaseConnectionString)
 	dbDriverName := bootstrap.GetEnvVar(DatabaseDriverName)
 
 	db, err := sql.Open(dbDriverName, dbString)
 	if err != nil {
-		trace_logger.Error("failed to open database connection: %v", zap.Error(err))
-		log.Panicf("failed to open database connection: %v", err)
+		logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to open database connection: %v", err)
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
-			trace_logger.Error("error when closing database connection", zap.Error(err))
-			slog.Error("error when closing database connection", "error", err)
+			logrus.Error("error when closing database connection", "error", err)
+
 		}
 	}()
 
-	span.AddEvent("Pinging database")
 	err = db.Ping()
 	if err != nil {
-		trace_logger.Error("could not establish a connection with the database: %v", zap.Error(err))
-		log.Panicf("could not establish a connection with the database: %v", err)
+		logrus.WithFields(LogrusFields(spanCtx)).Panicf("could not establish a connection with the database: %v", err)
 	}
-
-	span.AddEvent("Performing database query")
+	// location for db span
 	r, err := db.Query("SELECT id, desk, permissionflags FROM users.users")
 	if err != nil {
-		trace_logger.Error("failed to get users from database")
-		log.Panicf("failed to get users from database")
+		logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to get users from database")
 	}
 
-	span.AddEvent("Load users")
 	users := map[string]user{}
 	for r.Next() {
 		u := user{}
 		err := r.Scan(&u.id, &u.desk, &u.permissionFlags)
 		if err != nil {
-			trace_logger.Error("failed to scan user row: %v", zap.Error(err))
-			log.Panicf("failed to scan user row: %v", err)
+			logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to scan user row: %v", err)
 		}
 		u.token = uuid.New().String()
 		users[u.id] = u
 	}
 
-	trace_logger.Info("loaded users")
-	slog.Info("loaded users", "userCount", len(users))
+	logrus.WithFields(LogrusFields(spanCtx)).Info("loaded users", "userCount", len(users))
 
 	authServer := &authService{users: users}
 
@@ -281,13 +235,10 @@ func main() {
 		loginPort := "50551"
 		lis, err := net.Listen("tcp", ":"+loginPort)
 		if err != nil {
-			trace_logger.Error("failed to listen: %v", zap.Error(err))
-			log.Panicf("failed to listen: %v", err)
+			logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to listen: %v", err)
 		}
-		trace_logger.Info("authentication server listening")
-		slog.Info("authentication server listening", "listenAddress", lis.Addr())
-		span.AddEvent("authentication server listening")
 
+		logrus.WithFields(LogrusFields(spanCtx)).Info("authentication server listening", "listenAddress", lis.Addr())
 		authenticationGrpcServer := grpc.NewServer()
 		loginservice.RegisterLoginServiceServer(authenticationGrpcServer, authServer)
 
@@ -301,23 +252,19 @@ func main() {
 			authenticationGrpcServer.GracefulStop()
 		}()
 
-		slog.Info("starting authentication server", "port", loginPort)
-		trace_logger.Info("starting authentication server")
+		logrus.WithFields(LogrusFields(spanCtx)).Info("starting authentication server", "port", loginPort)
 		if err := authenticationGrpcServer.Serve(lis); err != nil {
-			trace_logger.Error("failed to start authentication server: %v", zap.Error(err))
-			log.Panicf("Failed to start authentication server: %v", err)
+			logrus.WithFields(LogrusFields(spanCtx)).Panicf("Failed to start authentication server: %v", err)
 		}
 	}()
 
 	authPort := "4000"
 	lis, err := net.Listen("tcp", ":"+authPort)
 	if err != nil {
-		trace_logger.Error("failed to listen: %v", zap.Error(err))
-		log.Panicf("failed to listen: %v", err)
+		logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to listen: %v", err)
 	}
-	trace_logger.Info("authentication server listening")
-	slog.Info("authorisation server listening", "listenAddress", lis.Addr())
 
+	logrus.WithFields(LogrusFields(spanCtx)).Info("authorisation server listening", "listenAddress", lis.Addr())
 	grpcServer := grpc.NewServer()
 
 	auth.RegisterAuthorizationServer(grpcServer, authServer)
@@ -332,11 +279,23 @@ func main() {
 		grpcServer.GracefulStop()
 	}()
 
-	slog.Info("starting authorization server", "port", authPort)
-	trace_logger.Info("starting authorization server")
+	logrus.WithFields(LogrusFields(spanCtx)).Info("starting authorization server", "port", authPort)
 	if err := grpcServer.Serve(lis); err != nil {
-		trace_logger.Error("failed to start authentication server: %v", zap.Error(err))
-		log.Panicf("Failed to start authorization server: %v", err)
+		logrus.WithFields(LogrusFields(spanCtx)).Panicf("Failed to start authorization server: %v", err)
 	}
 
+}
+
+func LogrusFields(spanCtx oteltrace.SpanContext) logrus.Fields {
+
+	if !spanCtx.IsValid() || globalAPMService == "" { // no trace info in spanctx or no env set
+		return logrus.Fields{}
+	}
+	return logrus.Fields{
+		"span_id":      spanCtx.SpanID().String(),
+		"trace_id":     spanCtx.TraceID().String(),
+		"trace_flags":  spanCtx.TraceFlags().String(),
+		"service.name": globalAPMService,
+		//"Deployment.environment": globalAPMService,
+	}
 }

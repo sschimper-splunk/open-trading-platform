@@ -18,8 +18,21 @@ spec:
       - envFrom:
         - configMapRef:
             name: opentp
-        # image: {{ .Values.dockerRepo }}/otp-authorization-service:{{ .Values.dockerTag }}
-        image: sschimpersplunk/opentradingplatform:test
+        image: ettec/otp-authorization-service:1.1.0
         imagePullPolicy: Always
         name: authorization-service
-  
+        env:
+          - name: NODE_IP
+            valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          - name: OTEL_TRACES_EXPORTER
+            value: "otlp"
+          - name:  OTEL_EXPORTER_OTLP_PROTOCOL
+            value: "grpc"
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: "http://$(NODE_IP):4317"
+          - name: OTEL_SERVICE_NAME
+            value: "Authorization-service"
+          - name: OTEL_PROPAGATORS
+            value: "tracecontext,baggage"
