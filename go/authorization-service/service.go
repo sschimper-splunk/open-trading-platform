@@ -21,6 +21,12 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 	"github.com/signalfx/splunk-otel-go/distro"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"google.golang.org/genproto/googleapis/rpc/status"
@@ -177,6 +183,42 @@ func main() {
 	}()
 
 	ctx := context.Background()
+
+	// Set up a trace exporter
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithInsecure(),                 // Adjust this depending on your OTLP endpoint
+		otlptracegrpc.WithEndpoint("localhost:4317"), // Update this with your collector's endpoint
+	)
+	if err != nil {
+		log.Fatalf("failed to create trace exporter: %v", err)
+	}
+
+	// Create a resource to describe the service
+	res := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String("authorization-service"),
+		semconv.ServiceVersionKey.String("1.0.0"),
+		attribute.String("environment", "seb-tradingtst-dev-1-workshop"),
+	)
+
+	// Create a tracer provider
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+	defer func() {
+		if err := tracerProvider.Shutdown(ctx); err != nil {
+			log.Fatalf("failed to shutdown tracer provider: %v", err)
+		}
+	}()
+
+	otel.SetTracerProvider(tracerProvider)
+	tracer := otel.Tracer("authorization-service")
+
+	ctx, span := tracer.Start(ctx, "main")
+	defer span.End()
+
+	// Set up a log exporter
 	splunk_logger, err := zap.NewProduction()
 	if err != nil {
 		panic(err)
@@ -186,6 +228,7 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: true})))
 
+	span.AddEvent("Connecting to Database")
 	dbString := bootstrap.GetEnvVar(DatabaseConnectionString)
 	dbDriverName := bootstrap.GetEnvVar(DatabaseDriverName)
 
@@ -201,18 +244,21 @@ func main() {
 		}
 	}()
 
+	span.AddEvent("Pinging database")
 	err = db.Ping()
 	if err != nil {
 		trace_logger.Error("could not establish a connection with the database: %v", zap.Error(err))
 		log.Panicf("could not establish a connection with the database: %v", err)
 	}
 
+	span.AddEvent("Performing database query")
 	r, err := db.Query("SELECT id, desk, permissionflags FROM users.users")
 	if err != nil {
 		trace_logger.Error("failed to get users from database")
 		log.Panicf("failed to get users from database")
 	}
 
+	span.AddEvent("Load users")
 	users := map[string]user{}
 	for r.Next() {
 		u := user{}
@@ -240,6 +286,7 @@ func main() {
 		}
 		trace_logger.Info("authentication server listening")
 		slog.Info("authentication server listening", "listenAddress", lis.Addr())
+		span.AddEvent("authentication server listening")
 
 		authenticationGrpcServer := grpc.NewServer()
 		loginservice.RegisterLoginServiceServer(authenticationGrpcServer, authServer)
