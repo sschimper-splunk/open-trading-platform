@@ -18,7 +18,7 @@ spec:
       - envFrom:
         - configMapRef:
             name: opentp
-        image: ettec/otp-authorization-service:1.1.0
+        image: sschimpersplunk/opentradingplatform:test
         imagePullPolicy: Always
         name: authorization-service
         env:
