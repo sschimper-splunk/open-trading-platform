@@ -210,10 +210,25 @@ func main() {
 		logrus.WithFields(LogrusFields(spanCtx)).Panicf("could not establish a connection with the database: %v", err)
 	}
 	// location for db span
-	r, err := db.Query("SELECT id, desk, permissionflags FROM users.users")
+	query := "SELECT id, desk, permissionflags FROM users.users"
+	stmt, err := db.PrepareContext(ctx, query)
 	if err != nil {
-		logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to get users from database")
+		span.RecordError(err) // Record the error in the span
+		logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to prepare query: %v", err)
 	}
+	defer stmt.Close()
+
+	r, err := stmt.QueryContext(ctx)
+	if err != nil {
+		span.RecordError(err) // Record the error in the span
+		logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to execute query: %v", err)
+	}
+	defer r.Close()
+
+	// r, err := db.Query(query)
+	// if err != nil {
+	// 	logrus.WithFields(LogrusFields(spanCtx)).Panicf("failed to get users from database")
+	// }
 
 	users := map[string]user{}
 	for r.Next() {

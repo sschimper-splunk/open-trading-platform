@@ -15,6 +15,7 @@ require (
 )
 
 require (
+	github.com/XSAM/otelsql v0.32.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20240423153145-555b57ec207b // indirect
 	github.com/emicklei/go-restful/v3 v3.12.1 // indirect
