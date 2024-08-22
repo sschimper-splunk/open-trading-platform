@@ -18,7 +18,7 @@ spec:
       - envFrom:
         - configMapRef:
             name: opentp
-        image: sschimpersplunk/opentradingplatform:test
+        image: sschimpersplunk/opentradingplatform:linux
         imagePullPolicy: Always
         name: authorization-service
         env:
